@@ -29,20 +29,26 @@ app = Flask(__name__)
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-def tengo_posicion():
+def tengo_posicion_symbol(symbol):
     try:
-        pos = api.get_position(SYMBOL)
+        pos = api.get_position(symbol)
         return int(float(pos.qty))
     except:
         return 0
 
-def calcular_qty():
+def tengo_posicion():
+    return tengo_posicion_symbol(SYMBOL)
+
+def calcular_qty_symbol(symbol):
     """Calcula cantidad de acciones según % del capital disponible."""
     cuenta = api.get_account()
     capital = float(cuenta.cash)
-    precio  = float(api.get_latest_trade(SYMBOL).price)
+    precio  = float(api.get_latest_trade(symbol).price)
     qty = int((capital * PCT_CAPITAL / 100) / precio)
-    return max(qty, 1)  # mínimo 1 acción
+    return max(qty, 1)
+
+def calcular_qty():
+    return calcular_qty_symbol(SYMBOL)
 
 # ─────────────────────────────────────────
 # ENDPOINTS
@@ -66,38 +72,39 @@ def webhook():
         log("❌ Token inválido")
         return jsonify({"error": "No autorizado"}), 403
 
-    accion = data.get("accion", "").upper()
-    log(f"📩 Alerta recibida: {accion}")
+    accion  = data.get("accion", "").upper()
+    symbol  = data.get("symbol", SYMBOL).upper()
+    log(f"📩 Alerta recibida: {accion} {symbol}")
 
     try:
-        posicion = tengo_posicion()
+        posicion = tengo_posicion_symbol(symbol)
 
         if accion == "COMPRAR" and posicion == 0:
-            qty = calcular_qty()
+            qty = calcular_qty_symbol(symbol)
             api.submit_order(
-                symbol=SYMBOL,
+                symbol=symbol,
                 qty=qty,
                 side="buy",
                 type="market",
                 time_in_force="day"
             )
-            log(f"✅ COMPRA ejecutada — {qty} x {SYMBOL}")
-            return jsonify({"status": "Compra ejecutada", "qty": qty}), 200
+            log(f"✅ COMPRA ejecutada — {qty} x {symbol}")
+            return jsonify({"status": "Compra ejecutada", "qty": qty, "symbol": symbol}), 200
 
         elif accion == "VENDER" and posicion > 0:
             api.submit_order(
-                symbol=SYMBOL,
+                symbol=symbol,
                 qty=posicion,
                 side="sell",
                 type="market",
                 time_in_force="day"
             )
-            log(f"✅ VENTA ejecutada — {posicion} x {SYMBOL}")
-            return jsonify({"status": "Venta ejecutada", "qty": posicion}), 200
+            log(f"✅ VENTA ejecutada — {posicion} x {symbol}")
+            return jsonify({"status": "Venta ejecutada", "qty": posicion, "symbol": symbol}), 200
 
         else:
-            log(f"⏸  Sin acción (accion={accion}, posición={posicion})")
-            return jsonify({"status": "Sin acción necesaria"}), 200
+            log(f"⏸  Sin accion (accion={accion}, symbol={symbol}, posicion={posicion})")
+            return jsonify({"status": "Sin accion necesaria"}), 200
 
     except Exception as e:
         log(f"❌ Error: {e}")
