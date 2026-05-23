@@ -1,7 +1,7 @@
 """
 SERVIDOR WEBHOOK — Multi-activo con protecciones avanzadas
 TradingView -> Render -> Alpaca
-Mejoras: Stop Loss, Trailing Stop, Filtro de tendencia, Anti-duplicados via Alpaca
+Mejoras: Stop Loss 1%, Take Profit 2%, Trailing Stop, Filtro de tendencia, Anti-duplicados
 """
 
 import os
@@ -21,6 +21,7 @@ TOKEN             = os.environ.get("TOKEN", "MI_TOKEN_SECRETO")
 SYMBOL            = os.environ.get("SYMBOL", "SPY")
 PCT_CAPITAL       = float(os.environ.get("PCT_CAPITAL", "20"))
 STOP_LOSS_PCT     = float(os.environ.get("STOP_LOSS_PCT", "1.0"))
+TAKE_PROFIT_PCT   = float(os.environ.get("TAKE_PROFIT_PCT", "2.0"))
 TRAILING_STOP_PCT = float(os.environ.get("TRAILING_STOP_PCT", "0.5"))
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
@@ -45,9 +46,7 @@ def tengo_posicion():
     return tengo_posicion_symbol(SYMBOL)
 
 def hay_orden_abierta(symbol):
-    """Verifica en Alpaca si hay ordenes abiertas O posicion existente."""
     try:
-        # Verificar ordenes abiertas
         ordenes = api.list_orders(status='open')
         for orden in ordenes:
             if orden.symbol == symbol:
@@ -57,11 +56,10 @@ def hay_orden_abierta(symbol):
         return False
 
 def puede_comprar(symbol):
-    """Doble verificacion: sin posicion Y sin ordenes abiertas."""
     posicion = tengo_posicion_symbol(symbol)
     orden_abierta = hay_orden_abierta(symbol)
     if posicion > 0:
-        log(f"Ya tengo posicion en {symbol} ({posicion} acciones), no compro")
+        log(f"Ya tengo posicion en {symbol}, no compro")
         return False
     if orden_abierta:
         log(f"Ya hay orden abierta para {symbol}, no compro")
@@ -69,7 +67,6 @@ def puede_comprar(symbol):
     return True
 
 def puede_vender(symbol):
-    """Verificacion: tengo posicion Y sin ordenes de venta abiertas."""
     posicion = tengo_posicion_symbol(symbol)
     if posicion == 0:
         return False
@@ -80,7 +77,6 @@ def puede_vender(symbol):
     return True
 
 def calcular_qty_symbol(symbol):
-    """Calcula UNA sola cantidad basada en el capital disponible."""
     cuenta = api.get_account()
     capital = float(cuenta.cash)
     precio  = float(api.get_latest_trade(symbol).price)
@@ -94,7 +90,6 @@ def precio_actual(symbol):
         return 0
 
 def mercado_alcista(symbol):
-    """Filtro de tendencia: EMA50 > EMA200."""
     try:
         barras = api.get_bars(symbol, tradeapi.TimeFrame.Day, limit=200).df
         if len(barras) < 200:
@@ -106,7 +101,6 @@ def mercado_alcista(symbol):
         return True
 
 def verificar_stops(symbol):
-    """Verifica stop loss y trailing stop."""
     try:
         pos = api.get_position(symbol)
         qty = int(float(pos.qty))
@@ -120,9 +114,20 @@ def verificar_stops(symbol):
         if precio_now == 0:
             return
 
+        # Actualizar precio maximo para trailing stop
         if symbol not in max_prices or precio_now > max_prices[symbol]:
             max_prices[symbol] = precio_now
 
+        # Take Profit fijo
+        take_profit_precio = precio_entrada * (1 + TAKE_PROFIT_PCT / 100)
+        if precio_now >= take_profit_precio:
+            ganancia = (precio_now - precio_entrada) * qty
+            log(f"TAKE PROFIT activado {symbol} — ganancia: ${ganancia:.2f}")
+            api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
+            max_prices.pop(symbol, None)
+            return
+
+        # Stop Loss fijo
         stop_loss_precio = precio_entrada * (1 - STOP_LOSS_PCT / 100)
         if precio_now <= stop_loss_precio:
             log(f"STOP LOSS activado {symbol} — precio {precio_now:.2f}")
@@ -130,6 +135,7 @@ def verificar_stops(symbol):
             max_prices.pop(symbol, None)
             return
 
+        # Trailing Stop
         trailing_precio = max_prices[symbol] * (1 - TRAILING_STOP_PCT / 100)
         if precio_now <= trailing_precio:
             ganancia = (precio_now - precio_entrada) * qty
@@ -173,6 +179,7 @@ def health():
             "balance": float(cuenta.cash),
             "posiciones": posiciones,
             "stop_loss_pct": STOP_LOSS_PCT,
+            "take_profit_pct": TAKE_PROFIT_PCT,
             "trailing_stop_pct": TRAILING_STOP_PCT
         }), 200
     except Exception as e:
@@ -194,7 +201,7 @@ def webhook():
     try:
         if accion == "COMPRAR":
             if not puede_comprar(symbol):
-                return jsonify({"status": "Compra bloqueada — ya hay posicion u orden"}), 200
+                return jsonify({"status": "Compra bloqueada"}), 200
 
             if not mercado_alcista(symbol):
                 log(f"Mercado bajista para {symbol}, compra bloqueada")
@@ -214,7 +221,7 @@ def webhook():
 
         elif accion == "VENDER":
             if not puede_vender(symbol):
-                return jsonify({"status": "Venta bloqueada — sin posicion o ya hay orden"}), 200
+                return jsonify({"status": "Venta bloqueada"}), 200
 
             posicion = tengo_posicion_symbol(symbol)
             api.submit_order(
@@ -238,5 +245,5 @@ def webhook():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    log(f"Servidor iniciado — Stop Loss: {STOP_LOSS_PCT}% | Trailing Stop: {TRAILING_STOP_PCT}%")
+    log(f"Servidor iniciado — SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}% | TS: {TRAILING_STOP_PCT}%")
     app.run(host="0.0.0.0", port=port)
