@@ -1,7 +1,7 @@
 """
 SERVIDOR WEBHOOK — Multi-activo con protecciones avanzadas
 TradingView -> Render -> Alpaca
-Mejoras: Stop Loss 1%, Take Profit 2%, Trailing Stop, Filtro de tendencia, Anti-duplicados
+v2: Fix cantidades fijas + max 1 simbolo a la vez + notificaciones Telegram
 """
 
 import os
@@ -10,6 +10,7 @@ import time
 from flask import Flask, request, jsonify
 import alpaca_trade_api as tradeapi
 from datetime import datetime
+import requests
 
 # ─────────────────────────────────────────
 # CONFIGURACION
@@ -23,11 +24,29 @@ PCT_CAPITAL       = float(os.environ.get("PCT_CAPITAL", "20"))
 STOP_LOSS_PCT     = float(os.environ.get("STOP_LOSS_PCT", "1.0"))
 TAKE_PROFIT_PCT   = float(os.environ.get("TAKE_PROFIT_PCT", "2.0"))
 TRAILING_STOP_PCT = float(os.environ.get("TRAILING_STOP_PCT", "0.5"))
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "8957492846:AAGophSxXOSZGT4Gd1cLTNOICzxpZIH5wEU")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "-5246245037")
+
+SIMBOLOS = ["SPY", "QQQ", "IWM"]
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 app = Flask(__name__)
 
 max_prices = {}
+
+# qty fija por simbolo — se calcula una sola vez al abrir posicion
+# y se guarda aca para que el cierre use exactamente la misma cantidad
+qty_abierta = {}
+
+# ─────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        print(f"Error Telegram: {e}")
 
 # ─────────────────────────────────────────
 # HELPERS
@@ -42,8 +61,12 @@ def tengo_posicion_symbol(symbol):
     except:
         return 0
 
-def tengo_posicion():
-    return tengo_posicion_symbol(SYMBOL)
+def hay_posicion_abierta_cualquier_simbolo():
+    """Verifica si hay alguna posicion abierta en cualquier simbolo — max 1 a la vez"""
+    for sym in SIMBOLOS:
+        if tengo_posicion_symbol(sym) > 0:
+            return True, sym
+    return False, None
 
 def hay_orden_abierta(symbol):
     try:
@@ -56,29 +79,38 @@ def hay_orden_abierta(symbol):
         return False
 
 def puede_comprar(symbol):
-    posicion = tengo_posicion_symbol(symbol)
-    orden_abierta = hay_orden_abierta(symbol)
-    if posicion > 0:
+    # Verificar si ya hay posicion en este simbolo
+    if tengo_posicion_symbol(symbol) > 0:
         log(f"Ya tengo posicion en {symbol}, no compro")
         return False
-    if orden_abierta:
+
+    # Verificar si hay posicion en CUALQUIER otro simbolo
+    hay_pos, sym_abierto = hay_posicion_abierta_cualquier_simbolo()
+    if hay_pos:
+        log(f"Ya tengo posicion abierta en {sym_abierto}, no compro {symbol}")
+        return False
+
+    # Verificar orden pendiente
+    if hay_orden_abierta(symbol):
         log(f"Ya hay orden abierta para {symbol}, no compro")
         return False
+
     return True
 
 def puede_vender(symbol):
     posicion = tengo_posicion_symbol(symbol)
     if posicion == 0:
         return False
-    orden_abierta = hay_orden_abierta(symbol)
-    if orden_abierta:
+    if hay_orden_abierta(symbol):
         log(f"Ya hay orden abierta para {symbol}, no vendo")
         return False
     return True
 
 def calcular_qty_symbol(symbol):
+    """Calcula qty usando el capital total (equity), no el cash disponible"""
     cuenta = api.get_account()
-    capital = float(cuenta.cash)
+    # Usar equity total para qty consistente, no cash que varia
+    capital = float(cuenta.equity)
     precio  = float(api.get_latest_trade(symbol).price)
     qty = int((capital * PCT_CAPITAL / 100) / precio)
     return max(qty, 1)
@@ -124,15 +156,20 @@ def verificar_stops(symbol):
             ganancia = (precio_now - precio_entrada) * qty
             log(f"TAKE PROFIT activado {symbol} — ganancia: ${ganancia:.2f}")
             api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
+            send_telegram(f"✅ TAKE PROFIT {symbol}\nEntrada: ${precio_entrada:.2f} → Salida: ${precio_now:.2f}\nGanancia: ${ganancia:.2f}")
             max_prices.pop(symbol, None)
+            qty_abierta.pop(symbol, None)
             return
 
         # Stop Loss fijo
         stop_loss_precio = precio_entrada * (1 - STOP_LOSS_PCT / 100)
         if precio_now <= stop_loss_precio:
+            perdida = (precio_now - precio_entrada) * qty
             log(f"STOP LOSS activado {symbol} — precio {precio_now:.2f}")
             api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
+            send_telegram(f"❌ STOP LOSS {symbol}\nEntrada: ${precio_entrada:.2f} → Salida: ${precio_now:.2f}\nPerdida: ${perdida:.2f}")
             max_prices.pop(symbol, None)
+            qty_abierta.pop(symbol, None)
             return
 
         # Trailing Stop
@@ -141,13 +178,15 @@ def verificar_stops(symbol):
             ganancia = (precio_now - precio_entrada) * qty
             log(f"TRAILING STOP activado {symbol} — ganancia bloqueada: ${ganancia:.2f}")
             api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
+            send_telegram(f"🔒 TRAILING STOP {symbol}\nEntrada: ${precio_entrada:.2f} → Salida: ${precio_now:.2f}\nResultado: ${ganancia:.2f}")
             max_prices.pop(symbol, None)
+            qty_abierta.pop(symbol, None)
 
     except Exception as e:
         log(f"Error stops {symbol}: {e}")
 
 def monitor_stops():
-    simbolos = ["SPY", "QQQ", "IWM"]
+    simbolos = SIMBOLOS
     while True:
         try:
             clock = api.get_clock()
@@ -170,13 +209,14 @@ def health():
     try:
         cuenta = api.get_account()
         posiciones = {}
-        for sym in ["SPY", "QQQ", "IWM"]:
+        for sym in SIMBOLOS:
             qty = tengo_posicion_symbol(sym)
             if qty > 0:
                 posiciones[sym] = qty
         return jsonify({
             "status": "ok",
             "balance": float(cuenta.cash),
+            "equity": float(cuenta.equity),
             "posiciones": posiciones,
             "stop_loss_pct": STOP_LOSS_PCT,
             "take_profit_pct": TAKE_PROFIT_PCT,
@@ -201,13 +241,16 @@ def webhook():
     try:
         if accion == "COMPRAR":
             if not puede_comprar(symbol):
-                return jsonify({"status": "Compra bloqueada"}), 200
+                hay_pos, sym_abierto = hay_posicion_abierta_cualquier_simbolo()
+                razon = f"Posicion abierta en {sym_abierto}" if hay_pos else "Bloqueado"
+                return jsonify({"status": f"Compra bloqueada — {razon}"}), 200
 
             if not mercado_alcista(symbol):
                 log(f"Mercado bajista para {symbol}, compra bloqueada")
                 return jsonify({"status": "Mercado bajista, compra bloqueada"}), 200
 
             qty = calcular_qty_symbol(symbol)
+            precio = precio_actual(symbol)
             api.submit_order(
                 symbol=symbol,
                 qty=qty,
@@ -215,15 +258,34 @@ def webhook():
                 type="market",
                 time_in_force="day"
             )
-            max_prices[symbol] = precio_actual(symbol)
+            max_prices[symbol] = precio
+            qty_abierta[symbol] = qty  # guardar qty para cierre consistente
+
+            msg = (f"📈 COMPRA {symbol}\n"
+                   f"Qty: {qty} acciones\n"
+                   f"Precio aprox: ${precio:.2f}\n"
+                   f"Capital usado: ~${qty * precio:,.0f} ({PCT_CAPITAL}%)\n"
+                   f"SL: ${precio * (1 - STOP_LOSS_PCT/100):.2f} | TP: ${precio * (1 + TAKE_PROFIT_PCT/100):.2f}")
+            send_telegram(msg)
             log(f"COMPRA ejecutada — {qty} x {symbol}")
             return jsonify({"status": "Compra ejecutada", "qty": qty, "symbol": symbol}), 200
 
         elif accion == "VENDER":
             if not puede_vender(symbol):
-                return jsonify({"status": "Venta bloqueada"}), 200
+                return jsonify({"status": "Venta bloqueada — sin posicion"}), 200
 
             posicion = tengo_posicion_symbol(symbol)
+            precio = precio_actual(symbol)
+
+            # Intentar obtener precio de entrada para calcular resultado
+            try:
+                pos = api.get_position(symbol)
+                precio_entrada = float(pos.avg_entry_price)
+                resultado = (precio - precio_entrada) * posicion
+                resultado_str = f"Resultado: ${resultado:+.2f}"
+            except:
+                resultado_str = ""
+
             api.submit_order(
                 symbol=symbol,
                 qty=posicion,
@@ -232,6 +294,14 @@ def webhook():
                 time_in_force="day"
             )
             max_prices.pop(symbol, None)
+            qty_abierta.pop(symbol, None)
+
+            emoji = "✅" if "+" in resultado_str else "❌"
+            msg = (f"{emoji} VENTA {symbol} (señal TradingView)\n"
+                   f"Qty: {posicion} acciones\n"
+                   f"Precio aprox: ${precio:.2f}\n"
+                   f"{resultado_str}")
+            send_telegram(msg)
             log(f"VENTA ejecutada — {posicion} x {symbol}")
             return jsonify({"status": "Venta ejecutada", "qty": posicion, "symbol": symbol}), 200
 
@@ -240,10 +310,12 @@ def webhook():
 
     except Exception as e:
         log(f"Error: {e}")
+        send_telegram(f"⚠️ Error en webhook {symbol}: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log(f"Servidor iniciado — SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}% | TS: {TRAILING_STOP_PCT}%")
+    send_telegram(f"🚀 Webhook Alpaca iniciado\nSL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}% | TS: {TRAILING_STOP_PCT}%\nSimbolos: {', '.join(SIMBOLOS)}")
     app.run(host="0.0.0.0", port=port)
