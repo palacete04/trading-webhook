@@ -314,7 +314,48 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 
-if __name__ == "__main__":
+@app.route("/adjust", methods=["POST"])
+def adjust_params():
+    global STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, PCT_CAPITAL
+    
+    data = request.json
+    if not data or data.get("token") != TOKEN:
+        return jsonify({"error": "No autorizado"}), 403
+    
+    cambios = []
+    
+    if "stop_loss_pct" in data:
+        STOP_LOSS_PCT = float(data["stop_loss_pct"])
+        cambios.append(f"SL: {STOP_LOSS_PCT}%")
+    
+    if "take_profit_pct" in data:
+        TAKE_PROFIT_PCT = float(data["take_profit_pct"])
+        cambios.append(f"TP: {TAKE_PROFIT_PCT}%")
+    
+    if "trailing_stop_pct" in data:
+        TRAILING_STOP_PCT = float(data["trailing_stop_pct"])
+        cambios.append(f"Trailing: {TRAILING_STOP_PCT}%")
+    
+    if "pct_capital" in data:
+        PCT_CAPITAL = float(data["pct_capital"])
+        cambios.append(f"Capital: {PCT_CAPITAL}%")
+    
+    if cambios:
+        msg = f"⚙️ Parámetros ajustados automáticamente:\n"
+        msg += "\n".join(f"  - {c}" for c in cambios)
+        send_telegram(msg)
+        log(f"Parámetros ajustados: {cambios}")
+    
+    return jsonify({
+        "status": "ok",
+        "params": {
+            "stop_loss_pct": STOP_LOSS_PCT,
+            "take_profit_pct": TAKE_PROFIT_PCT,
+            "trailing_stop_pct": TRAILING_STOP_PCT,
+            "pct_capital": PCT_CAPITAL
+        }
+    })
+    if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log(f"Servidor iniciado — SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}% | TS: {TRAILING_STOP_PCT}%")
     send_telegram(f"🚀 Webhook Alpaca iniciado\nSL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}% | TS: {TRAILING_STOP_PCT}%\nSimbolos: {', '.join(SIMBOLOS)}")
