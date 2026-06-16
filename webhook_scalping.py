@@ -1,7 +1,7 @@
 """
 SERVIDOR WEBHOOK — Multi-activo con protecciones avanzadas
 TradingView -> Render -> Alpaca
-v4: Migrado a alpaca-py + auto-adjust
+v4: Migrado a alpaca-py + auto-adjust + ping endpoint
 """
 
 import os
@@ -182,6 +182,10 @@ def monitor_stops():
             time.sleep(60)
 
 threading.Thread(target=monitor_stops, daemon=True).start()
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "ok"}), 200
 
 @app.route("/", methods=["GET"])
 def health():
